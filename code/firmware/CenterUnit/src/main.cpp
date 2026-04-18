@@ -11,7 +11,6 @@ const char* ssid = "LeanMonitor";
 const char* password = "12345678";
 
 // ================= I2C PINS =================
-// Change if needed for your board wiring.
 static const int I2C_SDA = 8;
 static const int I2C_SCL = 9;
 
@@ -41,11 +40,9 @@ float vehicleFactor = 1.15f;
 float axBias = 0, ayBias = 0, azBias = 0;
 float gxBias = 0, gyBias = 0, gzBias = 0;
 
-// Learned stable reference from calibration
 float calibPitchRef = 0.0f;
 float calibRollRef  = 0.0f;
 
-bool calibrationValid = false;
 unsigned long calibrationHoldUntil = 0;
 
 // ================= FILTER STATE =================
@@ -56,7 +53,6 @@ unsigned long lastMicros = 0;
 unsigned long lastRiskChangeMs = 0;
 
 // ================= BASE TUNING =================
-// Default values you requested.
 float baseAlphaStill   = 0.93f;
 float baseAlphaMotion  = 0.998f;
 float baseAccelWarn    = 0.04f;
@@ -73,7 +69,6 @@ float displayAlpha = 0.35f;
 float deadband     = 0.12f;
 
 // ================= OUTPUT =================
-float riskScore = 0.0f;
 int stableRisk = 0;
 
 static inline float clampf(float x, float lo, float hi) {
@@ -142,17 +137,40 @@ void autoTune(float accErr, float angRate) {
   deadband     = clampf(baseDeadband + 0.08f * (1.0f - stability), 0.0f, 0.30f);
 }
 
+// Fixed internal transform that matches the useful upside-down frame
+// (equivalent to a 180° rotation around Y: X and Z are inverted)
+void applyMountTransform(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
+  ax = -ax;
+  az = -az;
+  gx = -gx;
+  gz = -gz;
+}
+
 void calibrate() {
   Serial.println("Calibrating... keep vehicle stationary on level ground");
 
-  // PASS 1: sensor bias estimation
   long ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
 
   for (int i = 0; i < 1200; i++) {
     int16_t a, b, c, d, e, f;
     mpu.getMotion6(&a, &b, &c, &d, &e, &f);
-    ax += a; ay += b; az += c;
-    gx += d; gy += e; gz += f;
+
+    float fax = (float)a;
+    float fay = (float)b;
+    float faz = (float)c;
+    float fgx = (float)d;
+    float fgy = (float)e;
+    float fgz = (float)f;
+
+    applyMountTransform(fax, fay, faz, fgx, fgy, fgz);
+
+    ax += (long)fax;
+    ay += (long)fay;
+    az += (long)faz;
+    gx += (long)fgx;
+    gy += (long)fgy;
+    gz += (long)fgz;
+
     delay(2);
   }
 
@@ -164,7 +182,6 @@ void calibrate() {
   gyBias = gy / 1200.0f;
   gzBias = gz / 1200.0f;
 
-  // PASS 2: stable reference angle from the same mounted position
   double pitchSum = 0.0;
   double rollSum  = 0.0;
 
@@ -172,12 +189,21 @@ void calibrate() {
     int16_t a, b, c, d, e, f;
     mpu.getMotion6(&a, &b, &c, &d, &e, &f);
 
-    float fax = (a - axBias) / 16384.0f;
-    float fay = (b - ayBias) / 16384.0f;
-    float faz = (c - azBias) / 16384.0f;
+    float fax = (float)a;
+    float fay = (float)b;
+    float faz = (float)c;
+    float fgx = (float)d;
+    float fgy = (float)e;
+    float fgz = (float)f;
 
-    float p = atan2(fax, sqrt(fay * fay + faz * faz)) * 180.0f / PI;
-    float r = -atan2(fay, sqrt(fax * fax + faz * faz)) * 180.0f / PI;
+    applyMountTransform(fax, fay, faz, fgx, fgy, fgz);
+
+    float axn = (fax - axBias) / 16384.0f;
+    float ayn = (fay - ayBias) / 16384.0f;
+    float azn = (faz - azBias) / 16384.0f;
+
+    float p = atan2(axn, sqrt(ayn * ayn + azn * azn)) * 180.0f / PI;
+    float r = -atan2(ayn, sqrt(axn * axn + azn * azn)) * 180.0f / PI;
 
     pitchSum += p;
     rollSum  += r;
@@ -194,13 +220,20 @@ void calibrate() {
   rollDisplay = 0.0f;
 
   calibrated = true;
-  calibrationValid = true;
   calibrationHoldUntil = millis() + 500;
-
   lastMicros = micros();
   lastRiskChangeMs = millis();
 
   Serial.println("Calibration done");
+}
+
+String payloadToString(uint8_t* payload, size_t length) {
+  String s;
+  s.reserve(length);
+  for (size_t i = 0; i < length; i++) {
+    s += (char)payload[i];
+  }
+  return s;
 }
 
 void handleCommand(const String& msg) {
@@ -230,15 +263,6 @@ void handleCommand(const String& msg) {
   if (!autoMode) {
     applyManualTuning();
   }
-}
-
-String payloadToString(uint8_t* payload, size_t length) {
-  String s;
-  s.reserve(length);
-  for (size_t i = 0; i < length; i++) {
-    s += (char)payload[i];
-  }
-  return s;
 }
 
 void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
@@ -358,14 +382,6 @@ const char webpage[] PROGMEM = R"rawliteral(
     width: 100%;
   }
 
-  .small {
-    font-size: 12px;
-    color: #aaa;
-    margin-top: 3px;
-    line-height: 1.45;
-    word-break: break-word;
-  }
-
   .valueBox {
     margin-top: 8px;
     padding: 10px;
@@ -474,7 +490,6 @@ function quickBalanceChanged(v) {
   let x = parseFloat(v);
   document.getElementById("quickBalanceVal").innerText = x.toFixed(2);
 
-  // More left = more responsive, more right = more stable
   let alphaStill   = 0.86 + 0.13 * x;
   let alphaMotion  = 0.995 + 0.0045 * x;
   let accelWarn    = 0.01 + 0.07 * x;
@@ -558,7 +573,7 @@ ws.onmessage = (msg) => {
     "accelHigh: " + d.accelHigh.toFixed(3) + "<br>" +
     "displayAlpha: " + d.displayAlpha.toFixed(3) + "<br>" +
     "deadband: " + d.deadband.toFixed(3) + "<br><br>" +
-    "<b>Offsets</b><br>" +
+    "<b>Calibration reference</b><br>" +
     "calibRollRef: " + d.calibRollRef.toFixed(3) + "<br>" +
     "calibPitchRef: " + d.calibPitchRef.toFixed(3);
 };
@@ -618,16 +633,26 @@ void loop() {
   int16_t axR, ayR, azR, gxR, gyR, gzR;
   mpu.getMotion6(&axR, &ayR, &azR, &gxR, &gyR, &gzR);
 
+  float rawAx = (float)axR;
+  float rawAy = (float)ayR;
+  float rawAz = (float)azR;
+  float rawGx = (float)gxR;
+  float rawGy = (float)gyR;
+  float rawGz = (float)gzR;
+
+  // fixed internal frame transform
+  applyMountTransform(rawAx, rawAy, rawAz, rawGx, rawGy, rawGz);
+
   float dt = (micros() - lastMicros) / 1000000.0f;
   lastMicros = micros();
   if (dt <= 0.0f || dt > 0.1f) dt = 0.01f;
 
-  float ax = (axR - axBias) / 16384.0f;
-  float ay = (ayR - ayBias) / 16384.0f;
-  float az = (azR - azBias) / 16384.0f;
+  float ax = (rawAx - axBias) / 16384.0f;
+  float ay = (rawAy - ayBias) / 16384.0f;
+  float az = (rawAz - azBias) / 16384.0f;
 
-  float gx = (gxR - gxBias) / 131.0f;
-  float gy = (gyR - gyBias) / 131.0f;
+  float gx = (rawGx - gxBias) / 131.0f;
+  float gy = (rawGy - gyBias) / 131.0f;
 
   float accMag = sqrt(ax * ax + ay * ay + az * az);
   float accErr = fabs(accMag - 1.0f);
@@ -654,7 +679,6 @@ void loop() {
   pitchAngle = alpha * pitchGyro + (1.0f - alpha) * pitchAcc;
   rollAngle  = alpha * rollGyro  + (1.0f - alpha) * rollAcc;
 
-  // Hold the display at zero briefly after calibration so the filter can settle
   if (!calibrated || millis() < calibrationHoldUntil) {
     pitchAngle = 0.0f;
     rollAngle = 0.0f;
@@ -691,11 +715,15 @@ void loop() {
     lastRiskChangeMs = now;
   }
 
+  // Only flip pitch for the visualizer
+  float visualRoll = rollDisplay;
+  float visualPitch = -pitchDisplay;
+
   String data;
-  data.reserve(420);
+  data.reserve(450);
   data += "{";
-  data += "\"roll\":" + String(rollDisplay, 3) + ",";
-  data += "\"pitch\":" + String(pitchDisplay, 3) + ",";
+  data += "\"roll\":" + String(visualRoll, 3) + ",";
+  data += "\"pitch\":" + String(visualPitch, 3) + ",";
   data += "\"confidence\":" + String(confidence, 3) + ",";
   data += "\"risk\":" + String(effectiveRisk, 3) + ",";
   data += "\"level\":" + String(stableRisk) + ",";
